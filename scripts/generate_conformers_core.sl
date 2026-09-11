@@ -2,7 +2,6 @@
 #SBATCH -J flowr-conf-core
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
-#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=64G
 #SBATCH --partition=research
@@ -28,4 +27,6 @@ python -m flowr.gen.generate_conformers_from_smiles \
     --smiles_column chembl3d_isomeric_smiles \
     --ckpt_path /home/vtarasov/code/flowr_root/flowr_root_v2.2_mol.ckpt \
     --output_pkl casf16_core_flowr_conformers.pkl \
-    --n_conformers 1000
+    --n_conformers 1000 \
+    --stereo_mode strict \
+    --max_sample_iter 20
