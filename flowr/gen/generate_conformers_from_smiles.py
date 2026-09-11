@@ -80,9 +80,11 @@ DEFAULT_ODE_SAMPLING_STRATEGY = "linear"
 DEFAULT_CATEGORICAL_STRATEGY = "uniform-sample"
 
 
-def read_smiles_csv(csv_path: str, smiles_column: str | None):
+def read_smiles_csv(csv_path: str, smiles_column: str | None, delimiter: str = "auto"):
+    if delimiter == "auto":
+        delimiter = "\t" if Path(csv_path).suffix.lower() in (".tsv", ".tab") else ","
     with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(f, delimiter=delimiter)
         fieldnames = reader.fieldnames or []
         if smiles_column is None:
             candidates = [
@@ -279,7 +281,9 @@ def generate_conformers_for_mol(
 def main(args):
     torch.set_float32_matmul_precision("high")
 
-    smiles_list, smiles_column = read_smiles_csv(args.csv_path, args.smiles_column)
+    smiles_list, smiles_column = read_smiles_csv(
+        args.csv_path, args.smiles_column, args.delimiter
+    )
     print(f"Loaded {len(smiles_list)} SMILES from column '{smiles_column}' in {args.csv_path}")
 
     n_rows = len(smiles_list)
@@ -401,6 +405,7 @@ def get_args():
     # Data
     parser.add_argument("--csv_path", type=str, required=True, help="CSV file containing a column of SMILES strings")
     parser.add_argument("--smiles_column", type=str, default=None, help="Name of the SMILES column; auto-detected if omitted")
+    parser.add_argument("--delimiter", type=str, default="auto", help=r"Column delimiter; 'auto' uses tab for .tsv/.tab files and comma otherwise (pass e.g. '\t' to force)")
     parser.add_argument("--output_pkl", type=str, required=True, help="Output pickle path: {smiles: [Chem.Mol, ...]}")
     parser.add_argument("--output_sdf", type=str, default=None, help="Optional path to save the seed 3D structures used to seed the pipeline (one record per input SMILES)")
     parser.add_argument("--scratch_dir", type=str, default=None, help="Directory for per-molecule temporary SDF files (defaults to the system temp dir)")
