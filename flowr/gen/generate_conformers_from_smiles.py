@@ -194,6 +194,15 @@ def postprocess_conformer(mol, target_smiles, relax_iters, add_hs, stereo_mode):
             if stereo_mode == "strict":
                 return None, status
 
+    # Label the atoms with the stereochemistry its own coordinates encode. The model
+    # returns a graph with no chiral tags, so without this the conformer is
+    # geometrically correct but reads as unspecified to anything that inspects tags
+    # rather than coordinates (MolToSmiles, stereo-aware substructure matching, ...).
+    try:
+        Chem.AssignStereochemistryFrom3D(m)
+    except Exception:
+        pass
+
     return m, status
 
 
