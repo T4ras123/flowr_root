@@ -11,7 +11,6 @@ import lightning as L
 import numpy as np
 import torch
 import yaml
-from pymol import cmd
 from rdkit import Chem
 from rdkit.Chem import DataStructs, rdFingerprintGenerator
 
@@ -963,6 +962,8 @@ def write_ligand_pocket_complex_pdb(
     Notes:
         This function assumes that the PDB files can be parsed by RDKit via Chem.MolFromPDBFile.
     """
+    from pymol import cmd
+
     if not all_gen_ligs:
         raise ValueError("No ligand molecules provided.")
     if not all_gen_pdbs:

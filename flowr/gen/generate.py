@@ -13,6 +13,7 @@ def generate_molecules(
     save_traj=False,
     iter="",
     should_cancel=None,
+    final_inpaint=None,
 ):
     """
     Generate molecules
@@ -35,6 +36,12 @@ def generate_molecules(
         device (str, optional): PyTorch device for computation. Defaults to "cuda".
         save_traj (bool, optional): Whether to save generation trajectory. Defaults to False.
         iter (str, optional): Iteration identifier for file naming. Defaults to "".
+        final_inpaint (bool, optional): Whether to re-clamp the fixed atom/bond graph onto
+            the final corrector prediction. Without this, graph-inpainting-mode generation
+            (--graph_inpainting) returns molecules whose graph has drifted away from the
+            fixed input graph, because the last forward pass at t~1 is never re-inpainted.
+            Defaults to `args.final_inpaint` if set, else False (matches prior behavior for
+            callers that don't use graph_inpainting).
 
     Returns:
         list[rdkit.Chem.Mol]: Generated ligand molecules as RDKit Mol objects
@@ -47,6 +54,9 @@ def generate_molecules(
     lig_times_disc = torch.zeros(prior["coords"].size(0), device=device)
     prior_times = [lig_times_cont, lig_times_disc]
 
+    if final_inpaint is None:
+        final_inpaint = getattr(args, "final_inpaint", False)
+
     # Run generation N times
     output = model._generate(
         prior,
@@ -58,6 +68,7 @@ def generate_molecules(
         save_traj=save_traj,
         iter=iter,
         should_cancel=should_cancel,
+        final_inpaint=final_inpaint,
     )
 
     # Generate RDKit molecules

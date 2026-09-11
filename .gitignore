@@ -53,3 +53,9 @@ oe_license.txt
 code_to_pdf.py
 flowr_code.pdf
 flowr_code.html
+
+# Local run artifacts
+Miniforge3-*.sh
+slurm_outs/
+*.ckpt
+casf16_*_flowr_conformers.pkl

@@ -1518,8 +1518,11 @@ class GeometricNoiseSampler(NoiseSampler):
                 to_mol.bond_types.clone(),
                 to_mol.bond_indices.clone(),
             )
-            if self.n_hybridization_types is not None:
-                inp_hybridization = to_mol.hybridization.clone()
+            inp_hybridization = (
+                to_mol.hybridization.clone()
+                if self.n_hybridization_types is not None
+                else None
+            )
 
             mol = GeometricMol(
                 coords,
