@@ -1,12 +1,15 @@
 #!/bin/bash
 #SBATCH -J Finetune
 #SBATCH --time=00-04:00:00
-#SBATCH --ntasks-per-node=NUM_GPUS
+# Keep --ntasks-per-node and --gres in sync with num_gpus, and --cpus-per-task
+# with num_workers, both set below. sbatch parses these before the shell runs,
+# so they cannot reference those variables and must be literal numbers.
+#SBATCH --ntasks-per-node=1
 #SBATCH --nodes=1
 #SBATCH --mem-per-cpu=12G
-#SBATCH --cpus-per-task=NUM_WORKERS
+#SBATCH --cpus-per-task=12
 #SBATCH --partition=YOUR_PARTITION
-#SBATCH --gres=gpu:NUM_GPUS
+#SBATCH --gres=gpu:1
 #SBATCH --output=./finetune_%j.out
 #SBATCH --error=./finetune_%j.err
 
@@ -15,12 +18,12 @@ num_gpus=1  # Set the number of GPUs you want to use
 num_workers=12  # Set the number of CPU workers you want to use
 
 # ENVIRONMENT SETUP
+# One-time setup, from the repo root (pick the extra that matches the machine):
+#   uv sync --extra gpu   # Linux + NVIDIA GPU (CUDA 13 wheels)
+#   uv sync --extra cpu   # macOS / CPU-only
+# `uv run --no-sync` then uses .venv directly without re-resolving.
+export PATH="$HOME/.local/bin:$PATH"
 cd YOUR_CODE_PATH/flowr_root
-source YOUR_ENV_PATH/miniforge3/etc/profile.d/mamba.sh
-source YOUR_ENV_PATH/miniforge3/etc/profile.d/conda.sh 
-conda activate flowr_root
-
-export PYTHONPATH="YOUR_CODE_PATH/flowr_root"
 
 
 # MLFLOW LOGGING
@@ -36,7 +39,7 @@ data_path="$main_path/final"
 
 # CKPT PATH
 ckpt_path="/YOUR_CHECKPOINT_PATH"
-ckpt="$ckpt_path/flowr_root.ckpt"
+ckpt="$ckpt_path/flowr_root_v2.2.ckpt"
 
 # SAVE DIRECTORY
 save_dir="$main_path/flowr_logs/$exp_name/$run_name"
@@ -52,14 +55,13 @@ lr_schedule="exponential"
 lr_gamma=0.995
 
 # RUN FINETUNE
-python -m flowr.finetune \
+uv run --no-sync python -m flowr.finetune \
     --arch pocket \
     --pocket_noise fix \
     --seed 42 \
     --exp_name "$exp_name" \
     --run_name "$run_name" \
     --ckpt_path "$ckpt" \
-    --load_pretrained_ckpt \
     --gpus "$num_gpus" \
     --num_workers "$num_workers" \
     --batch_cost "$batch_cost" \
@@ -98,7 +100,6 @@ python -m flowr.finetune \
     --scaffold_elaboration \
     --predict_affinity \
     --affinity_loss_weight 3.0 \
-    # --interaction_inpainting \
     # --docking_loss_weight 1.0 \
     # --plddt_confidence_loss_weight 1.0 \
     # --train_confidence \

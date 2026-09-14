@@ -6,6 +6,7 @@ import math
 import os
 import pickle
 import resource
+import warnings
 from argparse import Namespace
 from functools import partial
 from pathlib import Path
@@ -23,7 +24,7 @@ from lightning.pytorch.callbacks import (
 )
 from lightning.pytorch.loggers import MLFlowLogger, WandbLogger
 from lightning.pytorch.strategies import DDPStrategy
-from openbabel import openbabel as ob
+from lightning.pytorch.utilities import rank_zero_info
 from rdkit import Chem, RDLogger
 from torch.utils.data import ConcatDataset
 from torchmetrics import MetricCollection
@@ -81,7 +82,15 @@ COMPILER_CACHE_SIZE = 128
 
 
 def disable_lib_stdout():
-    ob.obErrorLog.StopLogging()
+    # openbabel is an optional dependency and is only used to silence its own
+    # logger, so import it lazily and treat it as best-effort.
+    try:
+        from openbabel import openbabel as ob
+
+        ob.obErrorLog.StopLogging()
+    except ImportError:
+        pass
+
     RDLogger.DisableLog("rdApp.*")
 
 
@@ -404,10 +413,15 @@ def calc_train_steps(dm, epochs, acc_batches, gpus=1, num_nodes=1):
 
     In DDP, each GPU processes (total_batches / world_size) batches per epoch.
     world_size = gpus * num_nodes
+
+    ``--gpus 0`` selects CPU training, which ``build_trainer`` runs as a single device
+    (``accelerator="cpu", devices=1``). Taking ``gpus * num_nodes`` literally there
+    gives world_size 0 and a ZeroDivisionError before step 0, so clamp to at least one
+    process: this must agree with the trainer it feeds.
     """
     dm.setup("train")
     total_batches = len(dm.train_dataloader())
-    world_size = gpus * num_nodes
+    world_size = max(1, gpus * num_nodes)
     steps_per_epoch = math.ceil(total_batches / (acc_batches * world_size))
     return steps_per_epoch * epochs
 
@@ -568,6 +582,119 @@ def _inject_lora(lora_rank: int, lora_alpha: float, mod: torch.nn.Module):
             _inject_lora(lora_rank, lora_alpha, child)
 
 
+def _merge_lora(mod: torch.nn.Module):
+    """Merge LoRA weights back into base Linear layers and strip LoRA wrappers.
+
+    Must be called before re-injecting LoRA on a model that was already
+    LoRA-finetuned, to avoid nested LinearWithLoRA(LinearWithLoRA(...)).
+
+    LoRA forward: y = W x + (alpha/rank) * x @ A @ B, with A:(in,rank), B:(rank,out).
+    nn.Linear stores weight as (out, in) and computes x @ W.T, so the merged
+    delta to add to ``linear.weight`` is ((alpha/rank) * A @ B).T = (alpha/rank) * B.T @ A.T.
+    """
+    from flowr.models.lora import LinearWithLoRA
+
+    for name, child in mod.named_children():
+        if isinstance(child, LinearWithLoRA):
+            with torch.no_grad():
+                child.linear.weight.add_(
+                    (child.lora.alpha / child.lora.rank)
+                    * (child.lora.B.t() @ child.lora.A.t())
+                )
+            setattr(mod, name, child.linear)
+        else:
+            _merge_lora(child)
+
+
+def load_pretrained_generator(gen: torch.nn.Module, ckpt_path: str):
+    """Load the generator weights out of a FlowR training checkpoint into ``gen``.
+
+    A Lightning checkpoint stores the generator nested under the CFM module, so its
+    keys read ``gen.pocket_enc...``. The load target here *is* the generator, which
+    expects ``pocket_enc...``. Handing the raw state dict to ``load_state_dict`` with
+    ``strict=False`` therefore matched nothing at all: every checkpoint key was
+    "unexpected", every parameter kept its random init, and the pretrained weights were
+    silently discarded. Strip the prefix, and keep only ``gen.*`` keys so siblings such
+    as ``confidence_module.*`` do not turn up as unexpected.
+
+    Returns the ``(missing_keys, unexpected_keys)`` pair from the underlying load.
+    """
+    pretrained_state_dict = torch.load(ckpt_path, map_location=get_map_location())[
+        "state_dict"
+    ]
+    gen_state_dict = {
+        k[len("gen.") :]: v
+        for k, v in pretrained_state_dict.items()
+        if k.startswith("gen.")
+    }
+    if not gen_state_dict:
+        raise ValueError(
+            f"No 'gen.*' weights found in {ckpt_path}: the checkpoint holds "
+            f"{len(pretrained_state_dict)} key(s), none of which belong to the "
+            "generator. This is not a FlowR training checkpoint."
+        )
+
+    # ``strict=False`` stays, but only to tolerate *missing* keys: a head the pretrained
+    # run did not have (e.g. the affinity head under --predict_affinity) legitimately has
+    # nothing to restore. Unexpected keys always mean the checkpoint does not match this
+    # architecture, so fail loudly rather than repeating the silent no-op above.
+    missing_keys, unexpected_keys = gen.load_state_dict(gen_state_dict, strict=False)
+    if unexpected_keys:
+        raise RuntimeError(
+            f"Refusing to load {ckpt_path}: {len(unexpected_keys)} checkpoint key(s) "
+            f"have no counterpart in the model, e.g. {list(unexpected_keys)[:5]}. The "
+            "checkpoint architecture does not match the one requested on the command "
+            "line."
+        )
+
+    loaded = len(gen_state_dict) - len(missing_keys)
+    print(
+        f"Loaded {loaded}/{len(gen.state_dict())} pretrained generator tensors "
+        f"from {ckpt_path}"
+    )
+    if missing_keys:
+        print(
+            f"  WARNING: {len(missing_keys)} model parameter(s) had no pretrained "
+            f"weights and keep their random init, e.g. {list(missing_keys)[:5]}"
+        )
+    return missing_keys, unexpected_keys
+
+
+def _report_lora_trainable(fm_model: torch.nn.Module):
+    """Print the LoRA trainable/total split over the *whole* LightningModule.
+
+    LoRA is injected into ``gen`` only, but sibling modules (notably
+    ``confidence_module``, which fm_pocket creates next to ``gen`` and adds to the
+    optimizer in ``configure_optimizers``) are trained in full during a nominally
+    LoRA run. Counting only the modules LoRA touched would understate the trainable
+    fraction, so report over everything and name anything left trainable outside the
+    LoRA scope. Nothing is frozen here: that would change training semantics.
+    """
+    total_params = sum(p.numel() for p in fm_model.parameters())
+    trainable_params = sum(p.numel() for p in fm_model.parameters() if p.requires_grad)
+    print(
+        f"LoRA: {trainable_params}/{total_params} parameters trainable "
+        f"({100 * trainable_params / total_params:.2f}%) over the full model"
+    )
+
+    outside = []
+    for name, module in fm_model.named_children():
+        if name == "gen":
+            continue
+        n_trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        if n_trainable > 0:
+            outside.append((name, n_trainable))
+    if outside:
+        detail = ", ".join(f"{n} ({c:,} params)" for n, c in outside)
+        warnings.warn(
+            f"LoRA finetuning: the following top-level module(s) are outside the "
+            f"LoRA scope and remain fully trainable: {detail}. They will be trained "
+            f"in full, not via LoRA adapters.",
+            stacklevel=2,
+        )
+        print(f"  WARNING: fully trainable outside the LoRA scope: {detail}")
+
+
 # *****************************************************************************
 # *****************************************************************************
 # *****************************************************************************
@@ -583,8 +710,229 @@ def _inject_lora(lora_rank: int, lora_alpha: float, mod: torch.nn.Module):
 # *****************************************************************************
 
 
+def _configure_mlflow_tracking(save_dir) -> Optional[str]:
+    """Resolve the MLflow tracking URI, defaulting to a file store under ``save_dir``.
+
+    Two things are handled here so that a fresh clone trains with **zero** environment
+    variables set by the user -- which is the failure mode this guards against:
+
+    1. With ``MLFLOW_TRACKING_URI`` unset, MLflow falls back to ``./mlruns`` relative to
+       the *current working directory*. For a SLURM job that is wherever the script
+       happened to ``cd``, so runs scatter. We default it to ``<save_dir>/mlruns``
+       instead, next to the checkpoints the run produces.
+    2. mlflow >= 3.8 refuses to open a filesystem tracking backend at all unless
+       ``MLFLOW_ALLOW_FILE_STORE`` is set, raising ``MlflowException`` before step 0
+       ("The filesystem tracking backend ... is in maintenance mode"). We opt in on the
+       user's behalf, but only when the backend actually is a file store -- a database
+       backend is left untouched.
+
+    Anything the user exports wins: an existing ``MLFLOW_TRACKING_URI`` is used as-is and
+    an existing ``MLFLOW_ALLOW_FILE_STORE`` is never overwritten. The resolved URI is
+    written back into the environment so that DDP worker processes, which Lightning
+    re-launches with the inherited environment, all log to the same place.
+    """
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
+
+    if not tracking_uri:
+        mlruns_dir = Path(save_dir).expanduser().resolve() / "mlruns"
+        mlruns_dir.mkdir(parents=True, exist_ok=True)
+        tracking_uri = mlruns_dir.as_uri()
+        os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
+        print(f"MLFLOW_TRACKING_URI not set, logging to {tracking_uri}")
+
+    # Only a filesystem backend needs the opt-out flag. A URI with a scheme other than
+    # ``file:`` (sqlite:, postgresql:, http:, ...) is a database/server backend.
+    is_file_store = tracking_uri.startswith("file:") or "://" not in tracking_uri
+    if is_file_store:
+        os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
+
+    return tracking_uri
+
+
+class _AlwaysSaveLastMixin:
+    """Keep ``last.ckpt`` pinned to the newest weights, not to the newest *top-k save*.
+
+    Lightning's ``ModelCheckpoint`` only refreshes ``last.ckpt`` when a top-k save
+    actually fired at the same step: both ``on_train_epoch_end`` and
+    ``on_validation_end`` guard the call with
+    ``if self._last_global_step_saved == trainer.global_step``. Top-k membership is
+    decided by ``check_monitor_top_k``, which compares with ``torch.gt``/``torch.lt``,
+    so a *tied* score never displaces the k-th best -- ``0.0 > 0.0`` is False.
+
+    Those two facts together silently freeze ``last.ckpt``. On a from-scratch run
+    ``val-pb-validity`` sits at 0.0 for a long time; once ``save_top_k`` checkpoints are
+    banked at 0.0 nothing is ever written again, and ``on_train_end`` does not rescue it
+    (it only writes when ``last.ckpt`` was *never* saved). Measured on a 20-epoch run:
+    training ended at epoch 19 / step 40 while ``last.ckpt`` still held epoch 14 /
+    step 30, so the final six epochs of training were unrecoverable. Any run whose
+    monitored metric plateaus near the end loses its tail the same way.
+
+    This mixin repeats the "save last" step after each of those hooks, unconditionally.
+    ``_should_skip_saving_checkpoint`` already returns True when the current step has
+    been saved, so a step that *did* produce a top-k save is not written twice, and
+    sanity checking / non-fit stages stay excluded. Top-k selection itself is untouched.
+
+    Keeping this in the one existing callback -- rather than adding a second, unmonitored
+    ``ModelCheckpoint(save_top_k=0, save_last=True)`` -- keeps a single owner for
+    ``last.ckpt``. Two callbacks writing that same filename race over ``last_model_path``
+    and delete each other's files; and because ``MLFlowLogger`` remembers only whichever
+    callback saved most recently, the end-of-run upload would then drop the top-k
+    checkpoints entirely (verified: artifacts contained ``last.ckpt`` alone).
+    """
+
+    # ``Checkpoint.state_key`` is f"{self.__class__.__qualname__}{repr(kwargs)}", i.e. the
+    # class name is part of the key Lightning looks up when restoring callback state.
+    # Subclassing would therefore change it, so resuming a run whose checkpoints were
+    # written by the stock callback would find no match and silently start again with an
+    # empty ``best_k_models``. Keep the base class's key.
+    _state_key_qualname: str = "ModelCheckpoint"
+
+    @property
+    def state_key(self) -> str:
+        key = super().state_key
+        prefix = type(self).__qualname__
+        if key.startswith(prefix):
+            key = self._state_key_qualname + key[len(prefix) :]
+        return key
+
+    def _save_current_state_as_last(self, trainer: "pl.Trainer") -> None:
+        if not self.save_last or self._should_skip_saving_checkpoint(trainer):
+            return
+        self._save_last_checkpoint(trainer, self._monitor_candidates(trainer))
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        super().on_train_epoch_end(trainer, pl_module)
+        self._save_current_state_as_last(trainer)
+
+    def on_validation_end(self, trainer, pl_module) -> None:
+        super().on_validation_end(trainer, pl_module)
+        self._save_current_state_as_last(trainer)
+
+    def on_train_end(self, trainer, pl_module) -> None:
+        super().on_train_end(trainer, pl_module)
+        self._save_current_state_as_last(trainer)
+
+
+class LastAwareModelCheckpoint(_AlwaysSaveLastMixin, ModelCheckpoint):
+    """``ModelCheckpoint`` whose ``last.ckpt`` really is the last training state."""
+
+
+class LastAwareEMAModelCheckpoint(_AlwaysSaveLastMixin, EMAModelCheckpoint):
+    """``EMAModelCheckpoint`` whose ``last.ckpt``/``last-EMA.ckpt`` are the last state."""
+
+    _state_key_qualname = "EMAModelCheckpoint"
+
+
+class AffinityLabelMonitor(pl.Callback):
+    """Warn when an affinity-predicting run never sees a usable affinity label.
+
+    ``LossComputer.compute_affinity_loss`` masks out non-finite / negative targets and
+    falls back to ``(pred_values * 0.0).sum()`` when a batch has none. That is correct:
+    it keeps the affinity heads in the autograd graph (DDP requires every parameter to
+    receive a gradient) and never poisons the total loss with NaN. But on a dataset
+    with no affinity measurements at all it means the affinity heads receive *exactly
+    zero* gradient for the entire run, while the checkpoints that run writes still
+    record ``predict_affinity=True`` -- which is precisely the flag ``load_model``
+    checks before accepting an affinity request.
+
+    Granularity is deliberately **per epoch, warned once per run**. A single label-free
+    batch proves nothing: unlabelled systems inside a partly-labelled dataset are
+    legitimate and must keep training, so the check needs a full pass over the data
+    before it can honestly claim the run has no labels. Warning per batch would drown
+    the log; waiting for the end of the run would report it too late to act on. It is
+    never an error, for the same reason.
+    """
+
+    def __init__(self, weights_restored_from: Optional[str] = None):
+        super().__init__()
+        self._weights_restored_from = weights_restored_from
+        self._warned = False
+
+    @staticmethod
+    def _loss_computer(pl_module):
+        return getattr(pl_module, "loss_computer", None)
+
+    def on_train_epoch_start(self, trainer, pl_module) -> None:
+        loss_computer = self._loss_computer(pl_module)
+        if loss_computer is not None:
+            loss_computer.reset_affinity_label_stats()
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        if self._warned:
+            return
+        loss_computer = self._loss_computer(pl_module)
+        stats = getattr(loss_computer, "affinity_label_stats", None) or {
+            "batches": 0,
+            "valid_labels": 0,
+        }
+
+        # Both reductions run on every rank, unconditionally and in the same order: the
+        # decision (and therefore ``self._warned``) has to come out identical everywhere,
+        # or a later epoch would have some ranks entering a collective the others skip.
+        saw_head = trainer.strategy.reduce_boolean_decision(
+            bool(stats["batches"] > 0), all=False  # any rank ran the affinity heads
+        )
+        no_labels = trainer.strategy.reduce_boolean_decision(
+            bool(stats["valid_labels"] == 0), all=True  # every rank saw no label
+        )
+        if not no_labels:
+            return
+
+        self._warned = True
+        rule = "=" * 79
+        lines = ["", rule]
+        if saw_head:
+            lines += [
+                "  WARNING -- AFFINITY OBJECTIVE IS A NO-OP: no valid affinity label",
+                f"  was seen in epoch {trainer.current_epoch}.",
+                f"  {stats['batches']} batch(es) produced affinity predictions and",
+                "  not one carried a finite, non-negative target, so every affinity",
+                "  parameter received exactly zero gradient this epoch.",
+            ]
+        else:
+            lines += [
+                "  WARNING -- AFFINITY OBJECTIVE IS A NO-OP: the affinity loss never ran",
+                f"  in epoch {trainer.current_epoch}.",
+                "  No batch carried affinity data at all, so no affinity parameter received",
+                "  any gradient this epoch.",
+            ]
+        if self._weights_restored_from:
+            # Fine-tuning: the heads keep whatever they were loaded with. That is only a
+            # real problem if the source checkpoint's affinity head was itself untrained.
+            lines += [
+                "  The affinity heads therefore still hold exactly the values loaded from",
+                f"    {self._weights_restored_from}",
+                "  If that checkpoint's affinity head was already trained on labelled data",
+                "  (e.g. the released joint generation + affinity model) this run is a",
+                "  harmless no-op for affinity: the head keeps its pretrained weights and",
+                "  only the affinity forward pass is wasted -- though any LoRA adapters on",
+                "  those modules stay at zero and cannot learn. If it was not trained on",
+                "  labels, the head is still at its initial random values.",
+            ]
+        else:
+            # From scratch: nothing has ever trained these heads.
+            lines += [
+                "  The affinity heads were initialised fresh for this run, so they are still",
+                "  at RANDOM INITIALISATION and will stay there. Affinity numbers produced",
+                "  from this run's checkpoints are noise.",
+            ]
+        lines += [
+            "  Either way, the checkpoints this run writes record",
+            "  hyper_parameters['predict_affinity'] = True -- exactly the flag load_model",
+            "  checks -- so downstream affinity requests against them are accepted and",
+            "  answered with whatever those weights currently encode.",
+            "  Drop --predict_affinity / --affinity_loss_weight if this dataset carries no",
+            "  affinity measurements, or check that the labels are really being loaded.",
+            rule,
+        ]
+        # NOT rank_zero_warn: both flowr.train and flowr.finetune call
+        # warnings.filterwarnings("ignore", category=UserWarning) at import time, which
+        # swallows it whole. rank_zero_info goes through Lightning's logger and survives.
+        rank_zero_info("\n".join(lines))
+
+
 def build_trainer(
-    args, model=None, monitor_metric="val-pb_validity", save_top_k: int = 3
+    args, model=None, monitor_metric="val-pb-validity", save_top_k: int = 3
 ):
     epochs = 1 if args.trial_run else args.epochs
 
@@ -595,10 +943,15 @@ def build_trainer(
     lr_logger = LearningRateMonitor(logging_interval="step")
     mllogger = MLFlowLogger(
         experiment_name=args.dataset + "_" + args.exp_name,
-        tracking_uri=os.environ.get("MLFLOW_TRACKING_URI"),
+        tracking_uri=_configure_mlflow_tracking(args.save_dir),
         run_id=os.environ.get("MLFLOW_RUN_ID"),
         run_name=args.run_name if args.run_name else None,
-        log_model="best",
+        # Lightning types this ``Literal[True, False, "all"]``. MLFlowLogger.
+        # after_save_checkpoint tests ``== "all"`` and ``is True``, so the string "best"
+        # matched neither branch: ``_checkpoint_callback`` was never set and finalize()
+        # uploaded nothing, leaving artifacts/ empty on every completed run.
+        # True == upload the tracked checkpoints when the run finishes.
+        log_model=True,
     )
     if args.wandb:
         wdblogger = WandbLogger(project=project_name, log_model="all", offline=True)
@@ -616,7 +969,7 @@ def build_trainer(
             save_ema_weights_in_callback_state=True,
             evaluate_ema_weights_instead=True,
         )
-        checkpoint_callback = EMAModelCheckpoint(
+        checkpoint_callback = LastAwareEMAModelCheckpoint(
             dirpath=args.save_dir,
             save_top_k=save_top_k,
             # monitor="val-fc-validity",
@@ -625,7 +978,7 @@ def build_trainer(
             save_last=True,
         )
     else:
-        checkpoint_callback = ModelCheckpoint(
+        checkpoint_callback = LastAwareModelCheckpoint(
             dirpath=args.save_dir,
             save_top_k=save_top_k,
             # monitor="val-fc-validity",
@@ -643,6 +996,18 @@ def build_trainer(
     if args.use_ema:
         callbacks.append(ema_callback)
 
+    # An affinity objective that never sees a label trains nothing, yet still stamps the
+    # checkpoint as affinity-capable. See AffinityLabelMonitor.
+    if getattr(args, "predict_affinity", False) or (
+        getattr(args, "affinity_loss_weight", None) or 0.0
+    ) > 0:
+        callbacks.append(
+            AffinityLabelMonitor(
+                weights_restored_from=getattr(args, "ckpt_path", None)
+                or getattr(args, "load_ckpt", None)
+            )
+        )
+
     # When to do validation ckpt
     if args.val_check_epochs is None:
         val_check_epochs = 1
@@ -658,8 +1023,11 @@ def build_trainer(
 
     backbone = getattr(args, "backbone", "semla")
     find_unused = (backbone == "e3nn") or getattr(args, "find_unused_parameters", False)
+    # Same gpus-as-a-scale-factor assumption as calc_train_steps had: ``args.gpus`` is a
+    # device *count*, so --gpus 0 (the CPU path selected two lines below) turned this
+    # into a zero-second collective timeout.
     strategy = DDPStrategy(
-        timeout=datetime.timedelta(seconds=1800 * args.gpus),
+        timeout=datetime.timedelta(seconds=1800 * max(1, args.gpus)),
         find_unused_parameters=find_unused,
     )  # "ddp" if args.gpus > 1 else "auto"
     trainer = pl.Trainer(
@@ -883,13 +1251,8 @@ def build_model(
             use_is_fixed_embed=getattr(args, "use_is_fixed_embed", False),
             pocket_enc=pocket_enc,
         )
-    if args.load_pretrained_ckpt:
-        gen.load_state_dict(
-            torch.load(args.load_pretrained_ckpt, map_location=get_map_location())[
-                "state_dict"
-            ],
-            strict=False,
-        )
+    if getattr(args, "load_pretrained_ckpt", None):
+        load_pretrained_generator(gen, args.load_pretrained_ckpt)
 
     # Coordinate scaling
     coord_scale = 1.0  # defaults to 1.0 for pocket models
@@ -1031,7 +1394,10 @@ def build_model(
         mixed_uncond_inpaint=args.mixed_uncond_inpaint,
         use_t_loss_weights=args.use_t_loss_weights,
         corrector_iters=args.corrector_iters,
-        pretrained_weights=args.load_pretrained_ckpt is not None,
+        # ``load_pretrained_ckpt`` is a path (train.py / train_mol.py) or absent.
+        # ``is not None`` would read False (an unset store_true flag) as "supplied",
+        # so test truthiness instead and tolerate the arg being missing entirely.
+        pretrained_weights=bool(getattr(args, "load_pretrained_ckpt", None)),
         use_is_fixed_embed=getattr(args, "use_is_fixed_embed", False),
         mask_fixed_discrete_loss=getattr(args, "mask_fixed_discrete_loss", False),
         **hparams,
@@ -1088,6 +1454,23 @@ def load_model(
     hparams["substructure"] = args.substructure
     hparams["data_path"] = args.data_path
     hparams["save_dir"] = args.save_dir
+    # Inference-time ligand valence repair. Splatted into `load_from_checkpoint` below, so
+    # a value given on the command line wins over anything stale in the checkpoint; read
+    # back with `.get()` because the TRAINING path never sets these keys. `getattr` because
+    # flowr_vis builds a partial Namespace rather than going through argparse.
+    hparams["ligand_valence_repair"] = getattr(args, "ligand_valence_repair", True)
+    hparams["ligand_valence_repair_allow_bond_deletion"] = getattr(
+        args, "ligand_valence_repair_allow_bond_deletion", False
+    )
+    hparams["ligand_valence_repair_max_edits"] = getattr(
+        args, "ligand_valence_repair_max_edits", 2
+    )
+    hparams["ligand_valence_repair_top_k"] = getattr(
+        args, "ligand_valence_repair_top_k", 4
+    )
+    hparams["ligand_valence_repair_max_states"] = getattr(
+        args, "ligand_valence_repair_max_states", 200
+    )
     # Set optimizer hyperparameters
     hparams["lr"] = args.lr if getattr(args, "lr", None) else hparams.get("lr", 1e-4)
     hparams["lr_schedule"] = (
@@ -1145,6 +1528,38 @@ def load_model(
     hparams["energy_loss_weight"] = getattr(args, "energy_loss_weight", None)
     hparams["energy_loss_weighting"] = getattr(args, "energy_loss_weighting", None)
     hparams["energy_loss_decay_rate"] = getattr(args, "energy_loss_decay_rate", None)
+    # Carried over for provenance only -- every consumer reads args.use_ema directly.
+    # Without this the saved hparams inherit the pretrained checkpoint's value, so a
+    # run launched with --no-use_ema would still record use_ema: True.
+    hparams["use_ema"] = bool(getattr(args, "use_ema", hparams.get("use_ema", True)))
+
+    # The affinity head is baked into the checkpoint architecture: the generator is
+    # built with predict_affinity from *hparams* (the checkpoint), while the loss
+    # weight comes from *args*. Passing --predict_affinity / --affinity_loss_weight
+    # against a checkpoint trained without the head therefore does nothing at all --
+    # the model emits no "affinity" prediction, so compute_affinity_loss() returns {}
+    # and the objective is silently dropped. Turning the head on here instead would
+    # mean training a randomly-initialised head, which is worse. Fail loudly.
+    _ckpt_predict_affinity = bool(hparams.get("predict_affinity", False))
+    _args_predict_affinity = bool(getattr(args, "predict_affinity", False))
+    _affinity_loss_weight = getattr(args, "affinity_loss_weight", None) or 0.0
+    if not _ckpt_predict_affinity and (
+        _args_predict_affinity or _affinity_loss_weight > 0
+    ):
+        raise ValueError(
+            "Affinity objective requested but the checkpoint has no affinity head.\n"
+            f"  checkpoint hyper_parameters['predict_affinity'] = {_ckpt_predict_affinity}\n"
+            f"  --predict_affinity                              = {_args_predict_affinity}\n"
+            f"  --affinity_loss_weight                          = "
+            f"{getattr(args, 'affinity_loss_weight', None)}\n"
+            f"  checkpoint                                      = "
+            f"{ckpt_path if ckpt_path is not None else getattr(args, 'ckpt_path', None)}\n"
+            "predict_affinity is an architecture flag: it is fixed when the model is "
+            "first trained and cannot be switched on when loading. Either drop "
+            "--predict_affinity and --affinity_loss_weight, or start from a checkpoint "
+            "that was trained with the affinity head (the joint generation + affinity "
+            "model, e.g. flowr_root_v2.2.ckpt)."
+        )
 
     # Self-conditioning defaults
     hparams["self_condition_mode"] = hparams.get("self_condition_mode", "stacking")
@@ -1317,6 +1732,7 @@ def load_model(
         type_mask_index=type_mask_index,
         bond_mask_index=bond_mask_index,
         use_cosine_scheduler=args.use_cosine_scheduler,
+        cat_noise_euler_guard=getattr(args, "cat_noise_euler_guard", False),
     )
     _ckpt = ckpt_path if ckpt_path is not None else args.ckpt_path
     fm_model = CFM.load_from_checkpoint(
@@ -1342,16 +1758,30 @@ def load_model(
         _hparams["lora_alpha"] = args.lora_alpha
 
         # Load the pretrained weights
-        state_dict = torch.load(args.ckpt_path, map_location=get_map_location())[
-            "state_dict"
-        ]
-        state_dict = {k.replace("gen.", ""): v for k, v in state_dict.items()}
+        # Reuse the checkpoint already loaded at the top of this function: avoids a
+        # second ~1 GB disk read and, crucially, uses the *requested* checkpoint
+        # (``ckpt_path`` when given) rather than ``args.ckpt_path``.
+        # Strip the leading "gen." prefix only, and drop every non-"gen." key
+        # (e.g. ``confidence_module.*`` under --train_confidence) so the strict
+        # load below does not choke on unexpected keys.
+        state_dict = {
+            k[len("gen.") :]: v
+            for k, v in checkpoint["state_dict"].items()
+            if k.startswith("gen.")
+        }
         egnn = copy.deepcopy(egnn_gen)
         egnn.load_state_dict(state_dict, strict=True)
         assert (
             not args.affinity_finetuning
         ), "Cannot use both LoRA and affinity_finetune."
         assert not args.freeze_layers, "Cannot use both LoRA and freeze_layers."
+
+        # If the loaded ckpt already had LoRA, fold its delta into the base
+        # weights and strip wrappers so re-injection does not nest LoRA layers.
+        # No-op when starting from a non-LoRA base ckpt (round 0).
+        _merge_lora(egnn.ligand_dec)
+        if egnn.pocket_enc is not None:
+            _merge_lora(egnn.pocket_enc)
 
         # Apply LoRA to ligand decoder
         _inject_lora(
@@ -1365,41 +1795,37 @@ def load_model(
                 mod=egnn.pocket_enc,
             )
 
-        # Freeze all parameters except LoRA
-        trainable_params = 0
-        total_params = 0
-
+        # Freeze everything in the LoRA scope except the adapters themselves
         for n, p in egnn.ligand_dec.named_parameters():
-            total_params += p.numel()
-            if "lora" in n:
-                p.requires_grad = True
-                trainable_params += p.numel()
-            else:
-                p.requires_grad = False
+            p.requires_grad = "lora" in n
 
-        # Keep pocket encoder trainable if exists
+        # Same for the pocket encoder if it exists (it is *not* kept trainable:
+        # only its LoRA adapters are)
         if egnn.pocket_enc is not None:
             for n, p in egnn.pocket_enc.named_parameters():
-                total_params += p.numel()
-                if "lora" in n:
-                    p.requires_grad = True
-                    trainable_params += p.numel()
-                else:
-                    p.requires_grad = False
+                p.requires_grad = "lora" in n
 
-        print(
-            f"LoRA: {trainable_params}/{total_params} parameters trainable ({100*trainable_params/total_params:.2f}%)"
-        )
-        # Set the modified generator back to the model
+        # Set the modified generator back to the model before reporting, so the
+        # numbers below cover the whole LightningModule rather than just the two
+        # modules LoRA was injected into.
         fm_model.gen = egnn
         fm_model.save_hyperparameters(_hparams)
 
+        _report_lora_trainable(fm_model)
+
     elif getattr(args, "freeze_layers", None):
         print("Applying freeze_layers finetuning...")
-        state_dict = torch.load(args.ckpt_path, map_location=get_map_location())[
-            "state_dict"
-        ]
-        state_dict = {k.replace("gen.", ""): v for k, v in state_dict.items()}
+        # Reuse the checkpoint already loaded at the top of this function: avoids a
+        # second ~1 GB disk read and, crucially, uses the *requested* checkpoint
+        # (``ckpt_path`` when given) rather than ``args.ckpt_path``.
+        # Strip the leading "gen." prefix only, and drop every non-"gen." key
+        # (e.g. ``confidence_module.*`` under --train_confidence) so the strict
+        # load below does not choke on unexpected keys.
+        state_dict = {
+            k[len("gen.") :]: v
+            for k, v in checkpoint["state_dict"].items()
+            if k.startswith("gen.")
+        }
         egnn = copy.deepcopy(egnn_gen)
         egnn.load_state_dict(state_dict, strict=True)
         assert (
@@ -1510,10 +1936,17 @@ def load_model(
 
     elif getattr(args, "affinity_finetuning", None):
         print("Applying affinity_finetuning...")
-        state_dict = torch.load(args.ckpt_path, map_location=get_map_location())[
-            "state_dict"
-        ]
-        state_dict = {k.replace("gen.", ""): v for k, v in state_dict.items()}
+        # Reuse the checkpoint already loaded at the top of this function: avoids a
+        # second ~1 GB disk read and, crucially, uses the *requested* checkpoint
+        # (``ckpt_path`` when given) rather than ``args.ckpt_path``.
+        # Strip the leading "gen." prefix only, and drop every non-"gen." key
+        # (e.g. ``confidence_module.*`` under --train_confidence) so the strict
+        # load below does not choke on unexpected keys.
+        state_dict = {
+            k[len("gen.") :]: v
+            for k, v in checkpoint["state_dict"].items()
+            if k.startswith("gen.")
+        }
         egnn = copy.deepcopy(egnn_gen)
         egnn.load_state_dict(state_dict, strict=True)
         assert (
@@ -1587,6 +2020,23 @@ def load_mol_model(
     # Set dataset and save paths
     hparams["data_path"] = getattr(args, "data_path", None)
     hparams["save_dir"] = args.save_dir
+    # Inference-time ligand valence repair. Splatted into `load_from_checkpoint` below, so
+    # a value given on the command line wins over anything stale in the checkpoint; read
+    # back with `.get()` because the TRAINING path never sets these keys. `getattr` because
+    # flowr_vis builds a partial Namespace rather than going through argparse.
+    hparams["ligand_valence_repair"] = getattr(args, "ligand_valence_repair", True)
+    hparams["ligand_valence_repair_allow_bond_deletion"] = getattr(
+        args, "ligand_valence_repair_allow_bond_deletion", False
+    )
+    hparams["ligand_valence_repair_max_edits"] = getattr(
+        args, "ligand_valence_repair_max_edits", 2
+    )
+    hparams["ligand_valence_repair_top_k"] = getattr(
+        args, "ligand_valence_repair_top_k", 4
+    )
+    hparams["ligand_valence_repair_max_states"] = getattr(
+        args, "ligand_valence_repair_max_states", 200
+    )
     # Set sampling params
     hparams["integration-steps"] = args.integration_steps
     hparams["sampling_strategy"] = args.ode_sampling_strategy
@@ -1655,6 +2105,10 @@ def load_mol_model(
     hparams["energy_loss_weight"] = getattr(args, "energy_loss_weight", None)
     hparams["energy_loss_weighting"] = getattr(args, "energy_loss_weighting", None)
     hparams["energy_loss_decay_rate"] = getattr(args, "energy_loss_decay_rate", None)
+    # Carried over for provenance only -- every consumer reads args.use_ema directly.
+    # Without this the saved hparams inherit the pretrained checkpoint's value, so a
+    # run launched with --no-use_ema would still record use_ema: True.
+    hparams["use_ema"] = bool(getattr(args, "use_ema", hparams.get("use_ema", True)))
     hparams["affinity_loss_weight"] = getattr(args, "affinity_loss_weight", None)
     hparams["docking_loss_weight"] = getattr(args, "docking_loss_weight", None)
 
@@ -1754,6 +2208,7 @@ def load_mol_model(
         type_mask_index=type_mask_index,
         bond_mask_index=bond_mask_index,
         use_cosine_scheduler=args.use_cosine_scheduler,
+        cat_noise_euler_guard=getattr(args, "cat_noise_euler_guard", False),
     )
 
     # Initialize the ligand flow model
@@ -1782,10 +2237,17 @@ def load_mol_model(
         _hparams["lora_alpha"] = args.lora_alpha
 
         # Load the pretrained weights
-        state_dict = torch.load(args.ckpt_path, map_location=get_map_location())[
-            "state_dict"
-        ]
-        state_dict = {k.replace("gen.", ""): v for k, v in state_dict.items()}
+        # Reuse the checkpoint already loaded at the top of this function: avoids a
+        # second ~1 GB disk read and, crucially, uses the *requested* checkpoint
+        # (``ckpt_path`` when given) rather than ``args.ckpt_path``.
+        # Strip the leading "gen." prefix only, and drop every non-"gen." key
+        # (e.g. ``confidence_module.*`` under --train_confidence) so the strict
+        # load below does not choke on unexpected keys.
+        state_dict = {
+            k[len("gen.") :]: v
+            for k, v in checkpoint["state_dict"].items()
+            if k.startswith("gen.")
+        }
         egnn = copy.deepcopy(gen)
         egnn.load_state_dict(state_dict, strict=True)
         assert (
@@ -1793,29 +2255,26 @@ def load_mol_model(
         ), "Cannot use both LoRA and affinity_finetune."
         assert not args.freeze_layers, "Cannot use both LoRA and freeze_layers."
 
+        # If the loaded ckpt already had LoRA, fold its delta into the base
+        # weights and strip wrappers so re-injection does not nest LoRA layers.
+        # No-op when starting from a non-LoRA base ckpt (round 0).
+        _merge_lora(egnn.ligand_dec)
+
         # Apply LoRA to ligand decoder
         _inject_lora(
             lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, mod=egnn.ligand_dec
         )
 
-        # Freeze all parameters except LoRA
-        trainable_params = 0
-        total_params = 0
-
+        # Freeze everything in the LoRA scope except the adapters themselves
         for n, p in egnn.ligand_dec.named_parameters():
-            total_params += p.numel()
-            if "lora" in n:
-                p.requires_grad = True
-                trainable_params += p.numel()
-            else:
-                p.requires_grad = False
+            p.requires_grad = "lora" in n
 
-        print(
-            f"LoRA: {trainable_params}/{total_params} parameters trainable ({100*trainable_params/total_params:.2f}%)"
-        )
-        # Set the modified generator back to the model
+        # Set the modified generator back to the model before reporting, so the
+        # numbers below cover the whole LightningModule (see load_model).
         fm_model.gen = egnn
         fm_model.save_hyperparameters(_hparams)
+
+        _report_lora_trainable(fm_model)
 
     if return_info:
         return (
@@ -2011,7 +2470,10 @@ def build_mol_model(
         mixed_uncond_inpaint=args.mixed_uncond_inpaint,
         use_t_loss_weights=args.use_t_loss_weights,
         corrector_iters=args.corrector_iters,
-        pretrained_weights=args.load_pretrained_ckpt is not None,
+        # ``load_pretrained_ckpt`` is a path (train.py / train_mol.py) or absent.
+        # ``is not None`` would read False (an unset store_true flag) as "supplied",
+        # so test truthiness instead and tolerate the arg being missing entirely.
+        pretrained_weights=bool(getattr(args, "load_pretrained_ckpt", None)),
         inpaint_self_condition=getattr(args, "inpaint_self_condition", False),
         use_is_fixed_embed=getattr(args, "use_is_fixed_embed", False),
         mask_fixed_discrete_loss=getattr(args, "mask_fixed_discrete_loss", False),
@@ -2225,7 +2687,10 @@ def build_mol_mean_flow_model(
         mixed_uncond_inpaint=args.mixed_uncond_inpaint,
         use_t_loss_weights=args.use_t_loss_weights,
         corrector_iters=args.corrector_iters,
-        pretrained_weights=args.load_pretrained_ckpt is not None,
+        # ``load_pretrained_ckpt`` is a path (train.py / train_mol.py) or absent.
+        # ``is not None`` would read False (an unset store_true flag) as "supplied",
+        # so test truthiness instead and tolerate the arg being missing entirely.
+        pretrained_weights=bool(getattr(args, "load_pretrained_ckpt", None)),
         inpaint_self_condition=getattr(args, "inpaint_self_condition", False),
         use_is_fixed_embed=getattr(args, "use_is_fixed_embed", False),
         mask_fixed_discrete_loss=getattr(args, "mask_fixed_discrete_loss", False),

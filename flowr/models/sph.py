@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 
-from .sphcs_util import (
+from .sph_util import (
     binom,
     generate_clebsch_gordan_rsh,
     scatter_add,
@@ -176,7 +176,7 @@ def scalar2rsh(x: torch.Tensor, lmax: int) -> torch.Tensor:
 
 
 class SO3TensorProduct(nn.Module):
-    """
+    r"""
     SO3-equivariant Clebsch-Gordon tensor product.
 
     With combined indexing s=(l,m), this can be written as:

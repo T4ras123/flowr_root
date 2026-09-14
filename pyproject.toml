@@ -1,0 +1,244 @@
+[project]
+name = "flowr-root"
+version = "1.0.0"
+description = "FLOWR.root — structure-based generative flow matching for ligand design, joint affinity prediction and pocket-conditioned sampling."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = "==3.12.*"
+
+# NOTE ON PINNING
+# Almost everything is pinned loosely (`>=`) on purpose: the exact versions
+# live in `uv.lock`, which is committed and is what `uv sync` installs.
+# The three tight pins below each exist for a concrete reason:
+#   torch==2.11.*        the series verified on the CUDA 13 / GB10 box
+#   tensordict>=0.12,<0.13   its compiled extension is ABI-paired with torch 2.11
+#   biotite>=1.5,<2      flowr is written against the biotite 1.x API
+dependencies = [
+  # --- core numerics ---------------------------------------------------------
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "pandas>=2.0",
+  "scikit-learn>=1.3",
+  "networkx>=3.0",
+
+  # --- plotting --------------------------------------------------------------
+  "matplotlib>=3.8",
+  "seaborn>=0.13",
+
+  # --- torch stack -----------------------------------------------------------
+  # torch itself is resolved from an explicit PyTorch index; pick the wheel
+  # flavour with the mutually exclusive `cpu` / `gpu` extras (see [tool.uv]).
+  # Pinned to the 2.11 series: it is the version verified on the NVIDIA GB10
+  # (Blackwell, sm_121, CUDA 13) box, and it is what the CUDA 13 wheels on
+  # download.pytorch.org/whl/cu130 are built for.
+  "torch==2.11.*",
+  "torchmetrics>=1.4",
+  "lightning>=2.4",
+  "lightning-utilities>=0.11",
+  "torch-geometric>=2.6",
+  "tensordict>=0.12,<0.13",   # ABI-paired with torch 2.11
+
+  # --- cheminformatics / structural biology ----------------------------------
+  "rdkit>=2024.3",
+  "openbabel-wheel>=3.1.1",     # PyPI build of Open Babel + its Python bindings
+  "openmm>=8.2",
+  "pdbfixer>=1.10",
+  "datamol>=0.12",
+  "biotite>=1.5,<2",            # flowr targets the biotite 1.x API
+  "hydride>=1.2",
+  "pdbinf>=0.0.4",
+  "prolif>=2.0",
+  "biopython>=1.83",
+  "biopandas>=0.5",
+  "MDAnalysis>=2.7",
+  "prody>=2.4",
+  "rmsd>=1.6",
+
+  # --- storage / serialisation ----------------------------------------------
+  "lmdb>=1.4",
+  "dill>=0.3.8",
+  "pyyaml>=6.0",
+
+  # --- experiment tracking (lightning's WandbLogger / MLFlowLogger backends) --
+  "wandb>=0.17",
+  "mlflow>=2.14",
+
+  # --- misc runtime ----------------------------------------------------------
+  "tqdm>=4.66",
+  "requests>=2.31",
+  "rich>=13.0",
+  "omegaconf>=2.3",
+  "hydra-core>=1.3",
+  "typing-extensions>=4.9",
+]
+
+[project.optional-dependencies]
+# --- torch wheel flavour (mutually exclusive, see [tool.uv].conflicts) -------
+# macOS / CPU-only boxes:   uv sync --extra cpu
+cpu = ["torch==2.11.*"]
+# CUDA 13 / Blackwell (GB10, H100 with a cu13 driver, ...): uv sync --extra gpu
+gpu = ["torch==2.11.*"]
+
+# --- flowr_vis frontend server ----------------------------------------------
+# The frontend server itself needs no torch, but `torch` is a base dependency
+# of this project, so `--extra vis` must always be combined with `cpu` or
+# `gpu`, e.g. `uv sync --extra cpu --extra vis`.
+vis = [
+  "fastapi>=0.104.0",
+  "uvicorn[standard]>=0.24.0",
+  "python-multipart>=0.0.6",
+  "requests>=2.31.0",
+  "scikit-learn>=1.3.0",
+  "umap-learn>=0.5.0",
+  "biotite>=1.5,<2",
+  "rdkit>=2024.3",
+  "numpy>=1.24.0",
+]
+
+# --- notebooks in examples/ -------------------------------------------------
+notebooks = [
+  "jupyterlab>=4.0",
+  "notebook>=7.0",
+  "ipywidgets>=8.0",
+  "py3Dmol>=2.4",
+]
+
+# --- test suite (flowr/gen/tests/) ------------------------------------------
+# The repository ships tests but nothing depended on a runner, so a fresh
+# `uv sync` left them un-runnable: `pytest` was not installed and not declared.
+#   uv sync --extra gpu --extra dev && uv run --no-sync pytest flowr/gen/tests/
+dev = [
+  "pytest>=8",
+]
+
+# --- extended evaluation metrics (flowr/eval/evaluate_util.py) --------------
+eval = [
+  "fcd>=1.2",
+  "useful-rdkit-utils>=0.7",
+]
+
+# --- PLINDER dataset preprocessing -----------------------------------------
+# Used by flowr/data/preprocess.py, flowr/util/apo.py, flowr/util/plinder.py.
+# plinder depends on the upstream PyPI `posebusters`; see the
+# `exclude-dependencies` note under [tool.uv] for why that is filtered out in
+# favour of the fork vendored in this repo.
+plinder = ["plinder>=0.2"]
+
+
+# ---------------------------------------------------------------------------
+# NOT PACKAGED HERE -- deliberately undeclared, with the reason for each
+# ---------------------------------------------------------------------------
+# These appeared in the old conda environment files, or are imported by
+# individual `flowr` modules, but cannot be installed from PyPI. Every one of
+# them is imported lazily (inside the function that needs it), so the package
+# installs and every entrypoint imports without them; only the specific opt-in
+# code path raises ImportError. Each entry below was verified, not assumed.
+#
+#   openff-toolkit     YANKED on PyPI. The only release there (0.18.0) was
+#                      uploaded by a non-maintainer and has been yanked by the
+#                      OpenFF maintainers, so `uv lock` fails outright -- on
+#                      every platform, not just linux-aarch64. There is no
+#                      environment marker that makes this installable.
+#   openmmforcefields  Resolves from PyPI on its own (sdist, no declared deps)
+#                      but is useless without openff-toolkit + ambertools at
+#                      runtime, so there is no coherent `minimize` extra to
+#                      offer. Both are needed by flowr/util/minimize_energy.py;
+#                      if you need energy minimisation, install them into
+#                      .venv yourself from a source that carries working
+#                      builds (they are not on PyPI in a usable state).
+#   ambertools         No PyPI distribution at all.
+#   ase, fairchem-core Every fairchem-core release pins torch to a narrow
+#                      window (<=2.7.1 -> torch 2.6.x, <=2.21 -> torch 2.8.x,
+#                      2.22 -> torch 2.13.x). None of them admits the
+#                      torch==2.11.* required for CUDA 13 / GB10, so declaring
+#                      it would break GPU support. Only used by the otherwise
+#                      unreferenced flowr/util/ase_util.py.
+#   oddt               sdist-only, and the sdist fails to build: it imports
+#                      `six` at build time without declaring it. Also needs
+#                      Open Babel's Python bindings under a different name.
+#                      Only used by flowr/util/sampling/ifp.py.
+#   openeye-toolkits   Proprietary; needs OpenEye's own index plus a licence
+#                      file. flowr/util/sampling/openeye.py is un-importable
+#                      by design.
+#   pymol              `pymol-open-source` on PyPI is a 3.2.0a0 pre-release
+#                      with NO linux-aarch64 wheel at all, and its macOS-arm64
+#                      wheel is mis-linked: _cmd.so hardcodes an rpath into
+#                      the wheel author's private mamba prefix and dies with
+#                      `Library not loaded: @rpath/libpng16.16.dylib`.
+#                      Installed and tested here -- it does not work. Install
+#                      PyMOL from your system package manager or an upstream
+#                      installer if you need the PyMOL code paths in
+#                      flowr/gen/utils.py or flowr/util/pocket.py.
+#   posecheck, reduce  posecheck pins pandas==2.0.0, which has no cp312 wheel
+#                      and fails to build, so declaring it as an extra drags
+#                      the whole lock to an uninstallable pandas. It is used
+#                      only by two lazy imports (evaluate_posecheck and the
+#                      unused PoseCheckStrainEnergy); install it yourself with
+#                      `uv pip install posecheck` plus the `reduce` binary if
+#                      you need them.
+#   xtb, vina          External CLI binaries shelled out to by
+#                      flowr/eval/evaluate_xtb.py and the docking helpers.
+#                      Their PyPI packages are sdist-only Fortran/C++ builds
+#                      that provide Python bindings, not the CLI these call.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# `posebusters` is a *vendored, locally modified* fork -- it must always come
+# from this source tree and never from PyPI.
+packages = ["flowr", "posebusters"]
+
+[tool.hatch.build.targets.sdist]
+include = ["flowr", "posebusters", "README.md", "LICENSE"]
+
+# ---------------------------------------------------------------------------
+# uv configuration
+# ---------------------------------------------------------------------------
+# PyPI is declared explicitly, and first, on purpose.
+# `[[tool.uv.index]]` entries outrank indexes injected through the ambient
+# environment (`UV_EXTRA_INDEX_URL` / `--extra-index-url`), so listing PyPI
+# here guarantees that every dependency resolves against PyPI even when the
+# machine running `uv lock` has a private registry configured. Without it,
+# uv's default first-index-wins strategy lets any private index that happens
+# to publish a package of the same name (e.g. an internal `biotite`) shadow
+# PyPI entirely and break resolution. This keeps the committed `uv.lock`
+# reproducible for everyone cloning the repo, without having to weaken
+# resolution to `index-strategy = "unsafe-best-match"` (which would allow
+# *any* configured index to win a version race -- a dependency-confusion
+# hazard in a public repository).
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu13"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu13", extra = "gpu" },
+]
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "gpu" }]]
+
+# `posebusters` ships in THIS repo as a locally modified fork (see
+# [tool.hatch.build.targets.wheel] above). Excluding it here makes it
+# impossible for a transitive dependency to pull the upstream PyPI
+# distribution into site-packages, where it would shadow -- or be shadowed
+# by -- the vendored copy. `plinder` depends on `posebusters` and would
+# otherwise do exactly that; it gets the vendored fork instead.
+# `posecheck` is deliberately NOT excluded: it is no longer vendored, and it is
+# not an extra either -- it pins `pandas==2.0.0`, which has no cp312 wheel and
+# fails to build from sdist (see the note on it above). Install it yourself with
+# `uv pip install posecheck` if you need the PoseCheck code paths.
+exclude-dependencies = ["posebusters"]

@@ -20,16 +20,20 @@ from rdkit.Chem import (
 from rdkit.DataStructs import BulkTanimotoSimilarity, TanimotoSimilarity
 
 from posebusters import PoseBusters
-from semlaflex.util.sampling.ring_utils import substructure
+from flowr.util.sampling.ring_utils import substructure
 
 sys.path.append(os.path.join(RDConfig.RDContribDir, "SA_Score"))
 import sascorer
 from torchmetrics import MaxMetric, MeanMetric
 from tqdm import tqdm
 
-from semlaflex.util.rdkit import write_sdf_file
-from semlaflex.util.sampling.lipinski import lipinski_pass
-from semlaflex.util.sampling.utils import (
+# NOTE: the local write_sdf_file, not flowr.util.rdkit's. This module's molecules
+# are wrapper objects carrying .rdkit_mol (see mol.rdkit_mol below), which is what
+# extract_mol=True unwraps; flowr.util.rdkit's version takes `name` and has no such
+# parameter, so the call in evaluate_posebusters raised TypeError unconditionally.
+from flowr.util.sampling.walters_filter import write_sdf_file
+from flowr.util.sampling.lipinski import lipinski_pass
+from flowr.util.sampling.utils import (
     angle_distance,
     atom_types_distance,
     bond_length_distance,

@@ -22,6 +22,7 @@ from flowr.scriptutil import (
 from flowr.util.functional import (
     LigandPocketOptimization,
 )
+from flowr.util.device import resolve_device
 from flowr.util.metrics import evaluate_pb_validity
 from flowr.util.pocket import PocketComplexBatch
 from flowr.util.rdkit import write_sdf_file
@@ -77,7 +78,13 @@ def evaluate(args):
     ) = load_model(
         args,
     )
-    model = model.to("cuda")
+    # Device placement. `--gpus` is a device *count*, so `--gpus 0` selects CPU even on
+    # a CUDA machine; otherwise CUDA is used when present and CPU everywhere else.
+    # Apple's MPS backend is deliberately NOT auto-selected: it is opt-in via
+    # FLOWR_DEVICE=mps (see the CPU/macOS note in the README).
+    device = resolve_device(args)
+    print(f"Using device: {device}")
+    model = model.to(device)
     model.eval()
     print("Model complete.")
 
@@ -149,6 +156,7 @@ def evaluate(args):
                     save_traj=False,
                     iter=f"{k}_{i}",
                     guidance_params=guidance_params,
+                    device=device,
                 )
             else:
                 gen_ligs = generate_ligands_per_target_selective(
@@ -161,6 +169,7 @@ def evaluate(args):
                     save_traj=False,
                     iter=f"{k}_{i}",
                     guidance_params=guidance_params,
+                    device=device,
                 )
             if args.filter_valid_unique:
                 if gen_pdbs:
@@ -188,19 +197,11 @@ def evaluate(args):
         k += 1
 
     run_time = time.time() - start
-    if num_ligands == 0:
-        raise (
-            f"Reached {args.max_sample_iter} sampling iterations, but could not find any ligands."
-        )
-    elif num_ligands < args.sample_n_molecules_per_target:
-        print(
-            f"FYI: Reached {args.max_sample_iter} sampling iterations, but could only find {num_ligands} ligands."
-        )
-    elif num_ligands > args.sample_n_molecules_per_target:
-        all_gen_ligs = all_gen_ligs[: args.sample_n_molecules_per_target]
-        if all_gen_pdbs:
-            all_gen_pdbs = all_gen_pdbs[: args.sample_n_molecules_per_target]
 
+    # Sanitize *before* counting. With --filter_valid_unique off nothing had removed the
+    # unparseable molecules yet, so num_ligands counted raw samples: the "no ligands"
+    # guard below could not fire even when every molecule was dropped here, and the run
+    # reported success after writing an empty SDF.
     if not args.filter_valid_unique:
         # Remove all Nones from the generated ligands
         if gen_pdbs:
@@ -217,6 +218,29 @@ def evaluate(args):
                 filter_uniqueness=False,
                 sanitize=True,
             )
+
+    num_sampled_ligands = num_ligands
+    num_ligands = len(all_gen_ligs)
+    if num_ligands == 0:
+        lost = (
+            f" ({num_sampled_ligands} were sampled but none survived sanitization)"
+            if num_sampled_ligands
+            else ""
+        )
+        # NB: `raise <str>` here raised TypeError: exceptions must derive from
+        # BaseException, destroying the diagnostic it was written to deliver.
+        raise RuntimeError(
+            f"Reached {args.max_sample_iter} sampling iterations, but could not find "
+            f"any ligands{lost}."
+        )
+    elif num_ligands < args.sample_n_molecules_per_target:
+        print(
+            f"FYI: Reached {args.max_sample_iter} sampling iterations, but could only find {num_ligands} ligands."
+        )
+    elif num_ligands > args.sample_n_molecules_per_target:
+        all_gen_ligs = all_gen_ligs[: args.sample_n_molecules_per_target]
+        if all_gen_pdbs:
+            all_gen_pdbs = all_gen_pdbs[: args.sample_n_molecules_per_target]
 
     ref_ligs = model._generate_ligs(
         data_target, lig_mask=data_target["lig_mask"].bool(), scale=model.coord_scale
@@ -238,10 +262,12 @@ def evaluate(args):
     out_dict["ref_pdb"] = ref_pdb
     out_dict["ref_pdb_with_hs"] = ref_pdb_with_hs
     out_dict["run_time"] = run_time
+    out_dict["repair_stats"] = util.repair_stats_summary(model)
 
     print(
         f"\n Run time={round(run_time, 2)}s for {len(out_dict['gen_ligs'])} molecules \n"
     )
+    util.print_repair_stats(out_dict["repair_stats"])
 
     # Filter by diversity
     print("Filtering ligands by diversity...")
@@ -442,7 +468,6 @@ def get_args():
         help="Standard deviation of the pocket coordinate noise"
     )
     parser.add_argument("--ckpt_path", type=str)
-    parser.add_argument("--lora_finetuned", action="store_true")
     parser.add_argument("--data_path", type=str)
     parser.add_argument("--dataset", type=str)
     parser.add_argument("--save_dir", type=str)
@@ -512,6 +537,34 @@ def get_args():
     )
     parser.add_argument("--use_sde_simulation", action="store_true")
     parser.add_argument("--use_cosine_scheduler", action="store_true")
+
+    # Inference-time sampler guard and decode repair. Every one of these defaults OFF, so a
+    # command line that does not name them behaves exactly as before.
+    parser.add_argument("--cat_noise_euler_guard", action="store_true",
+        help="Silence the categorical sampling noise over the terminal window where the "
+             "Euler step stops being a valid probability step (1-t <= step*(1+noise*K)). "
+             "Without it a converged prediction is still kicked off its argmax at a rate "
+             "of (K-1)*noise/steps per step, which corrupts the input to the final passes.")
+    parser.add_argument("--ligand_valence_repair", dest="ligand_valence_repair",
+        action="store_true", default=True,
+        help="ON BY DEFAULT. When a generated ligand's argmax decode FAILS to build, "
+             "re-decode it to the model's own highest-joint-probability assignment that "
+             "satisfies the RDKit-probed valence limits. It is gated on the build having "
+             "already returned None, so it can only ADD molecules -- it never alters or "
+             "drops one that built, and it is never applied to reference ligands. "
+             "Disable with --no_ligand_valence_repair.")
+    parser.add_argument("--no_ligand_valence_repair", dest="ligand_valence_repair",
+        action="store_false",
+        help="Deliver the raw argmax decode: a ligand whose independently-argmaxed heads "
+             "name a chemically impossible atom is dropped rather than re-decoded.")
+    parser.add_argument("--ligand_valence_repair_allow_bond_deletion", action="store_true",
+        help="Let the repair escape an over-valence by DELETING a bond, not just demoting "
+             "it. Off by default because deleting a bond can split the molecule, turning a "
+             "valence failure into a disconnected one -- that lifts validity but not "
+             "fully-connected validity.")
+    parser.add_argument("--ligand_valence_repair_max_edits", type=int, default=2)
+    parser.add_argument("--ligand_valence_repair_top_k", type=int, default=4)
+    parser.add_argument("--ligand_valence_repair_max_states", type=int, default=200)
     parser.add_argument(
         "--bucket_cost_scale", type=str, default=DEFAULT_BUCKET_COST_SCALE
     )

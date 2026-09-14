@@ -18,6 +18,7 @@ from flowr.predict.predict import predict_affinity_batch
 from flowr.scriptutil import (
     load_model,
 )
+from flowr.util.device import resolve_device
 
 warnings.filterwarnings(
     "ignore", category=UserWarning, message="TypedStorage is deprecated"
@@ -64,7 +65,13 @@ def evaluate(args):
     ) = load_model(
         args,
     )
-    model = model.to("cuda")
+    # Device placement. `--gpus` is a device *count*, so `--gpus 0` selects CPU even on
+    # a CUDA machine; otherwise CUDA is used when present and CPU everywhere else.
+    # Apple's MPS backend is deliberately NOT auto-selected: it is opt-in via
+    # FLOWR_DEVICE=mps (see the CPU/macOS note in the README).
+    device = resolve_device(args)
+    print(f"Using device: {device}")
+    model = model.to(device)
     model.eval()
     print("Model complete.")
 
@@ -98,6 +105,7 @@ def evaluate(args):
     dataloader = get_dataloader(args, dataset, interpolant)
     for i, batch in tqdm(enumerate(dataloader), desc="Predicting affinity..."):
         prior, posterior, _, _ = batch
+        batch_start = time.time()
         gen_ligs_with_aff = predict_affinity_batch(
             args,
             model=model,
@@ -106,9 +114,13 @@ def evaluate(args):
             noise_scale=args.coord_noise_scale,
             eps=1e-4,
             seed=args.seed + i,
+            device=device,
         )
+        times.append(time.time() - batch_start)
 
-        # validity of generated ligands
+        # Sanity check on the scored ligands. These are the *input* ligands (affinity
+        # prediction scores what it is given, it does not generate molecules), so this
+        # is a check on the input data rather than on model output.
         validity = np.mean(
             [smolRD.mol_is_valid(mol, connected=True) for mol in gen_ligs_with_aff]
         )
@@ -122,8 +134,11 @@ def evaluate(args):
     print(
         f"\n Mean run time={round(global_run_time, 2)}s for {len(all_gen_ligs_with_aff)} molecules"
     )
-    print(f"Mean time per batch={np.mean(times):.3f} \pm {np.std(times):.2f} seconds")
-    print(f"Validity of generated ligands: {np.mean(validities):.3f}\n")
+    if times:
+        print(
+            f"Mean time per batch={np.mean(times):.3f} \\pm {np.std(times):.2f} seconds"
+        )
+    print(f"Validity of scored ligands: {np.mean(validities):.3f}\n")
 
     # Save ligands as SDF
     sdf_path = Path(args.save_dir) / "gen_ligs_with_aff.sdf"
@@ -167,7 +182,6 @@ def get_args():
         help="Standard deviation of the pocket coordinate noise"
     )
     parser.add_argument("--ckpt_path", type=str)
-    parser.add_argument("--lora_finetuned", action="store_true")
     parser.add_argument("--data_path", type=str)
     parser.add_argument("--splits_path", type=str, default=None)
     parser.add_argument("--dataset", type=str)
@@ -205,7 +219,8 @@ def get_args():
         help="SMILES/SMARTS string or space-separated atom indices (e.g., '10 11 12 13' or 'c1ccccc1')"
     )
     parser.add_argument("--core_growing", action="store_true")
-    parser.add_argument("--ring_system_indexing", default=0, type=int)
+    parser.add_argument("--ring_system_index", "--ring_system_indexing", default=0, type=int,
+                        help="Index of the ring system to keep as the core when using --core_growing (0-indexed; use flowr.data.interpolate.get_num_ring_systems to see how many exist)")
     parser.add_argument(
         "--graph_inpainting",
         default=None,
@@ -230,6 +245,34 @@ def get_args():
     )
     parser.add_argument("--use_sde_simulation", action="store_true")
     parser.add_argument("--use_cosine_scheduler", action="store_true")
+
+    # Inference-time sampler guard and decode repair. Every one of these defaults OFF, so a
+    # command line that does not name them behaves exactly as before.
+    parser.add_argument("--cat_noise_euler_guard", action="store_true",
+        help="Silence the categorical sampling noise over the terminal window where the "
+             "Euler step stops being a valid probability step (1-t <= step*(1+noise*K)). "
+             "Without it a converged prediction is still kicked off its argmax at a rate "
+             "of (K-1)*noise/steps per step, which corrupts the input to the final passes.")
+    parser.add_argument("--ligand_valence_repair", dest="ligand_valence_repair",
+        action="store_true", default=True,
+        help="ON BY DEFAULT. When a generated ligand's argmax decode FAILS to build, "
+             "re-decode it to the model's own highest-joint-probability assignment that "
+             "satisfies the RDKit-probed valence limits. It is gated on the build having "
+             "already returned None, so it can only ADD molecules -- it never alters or "
+             "drops one that built, and it is never applied to reference ligands. "
+             "Disable with --no_ligand_valence_repair.")
+    parser.add_argument("--no_ligand_valence_repair", dest="ligand_valence_repair",
+        action="store_false",
+        help="Deliver the raw argmax decode: a ligand whose independently-argmaxed heads "
+             "name a chemically impossible atom is dropped rather than re-decoded.")
+    parser.add_argument("--ligand_valence_repair_allow_bond_deletion", action="store_true",
+        help="Let the repair escape an over-valence by DELETING a bond, not just demoting "
+             "it. Off by default because deleting a bond can split the molecule, turning a "
+             "valence failure into a disconnected one -- that lifts validity but not "
+             "fully-connected validity.")
+    parser.add_argument("--ligand_valence_repair_max_edits", type=int, default=2)
+    parser.add_argument("--ligand_valence_repair_top_k", type=int, default=4)
+    parser.add_argument("--ligand_valence_repair_max_states", type=int, default=200)
     parser.add_argument(
         "--categorical_strategy", type=str, default=DEFAULT_CATEGORICAL_STRATEGY
     )

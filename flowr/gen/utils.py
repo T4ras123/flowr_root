@@ -189,39 +189,31 @@ class dotdict(dict):
 
 
 def get_conditional_mode(args):
-    return (
-        "scaffold_hopping"
-        if args.scaffold_hopping
-        else (
-            "scaffold_elaboration"
-            if args.scaffold_elaboration
-            else (
-                "linker_inpainting"
-                if args.linker_inpainting
-                else (
-                    "core_growing"
-                    if args.core_growing
-                    else (
-                        "fragment_growing"
-                        if getattr(args, "fragment_growing", False)
-                        else (
-                            "fragment_inpainting"
-                            if args.fragment_inpainting
-                            else (
-                                "substructure_inpainting"
-                                if args.substructure_inpainting
-                                else (
-                                    "interaction_conditional"
-                                    if args.interaction_conditional
-                                    else None
-                                )
-                            )
-                        )
-                    )
-                )
-            )
-        )
-    )
+    """Return the conditional-generation mode selected on the command line.
+
+    Every flag is read through ``getattr`` with a default because the generation
+    entrypoints do not all define the same set: ``generate_from_sdf_mol`` has no
+    ``--interaction_conditional``. That flag is only reached when no other mode is
+    set, so an unguarded read crashed *every unconditional* ligand-only run with
+    ``AttributeError: 'Namespace' object has no attribute 'interaction_conditional'``
+    while conditional runs passed -- which is why the shipped generate_sdf.sl, which
+    hardcodes --substructure_inpainting, masked it.
+
+    The order below is the original precedence and must be preserved.
+    """
+    for mode in (
+        "scaffold_hopping",
+        "scaffold_elaboration",
+        "linker_inpainting",
+        "core_growing",
+        "fragment_growing",
+        "fragment_inpainting",
+        "substructure_inpainting",
+        "interaction_conditional",
+    ):
+        if getattr(args, mode, False):
+            return mode
+    return None
 
 
 def filter_substructure(
@@ -230,6 +222,7 @@ def filter_substructure(
     inpainting_mode: str,
     substructure_query: Optional[str] = None,
     max_fragment_cuts: int = 3,
+    ring_system_index: int = 0,
     canonicalize_conformer: Optional[bool] = False,
 ):
     """
@@ -243,6 +236,9 @@ def filter_substructure(
                         'interaction_conditional']
         substructure_query: SMILES/SMARTS string for substructure mode or list of atom IDs
         max_fragment_cuts: Maximum cuts for fragment mode
+        ring_system_index: Which ring system is kept as the core in 'core_growing'
+                        mode (0-indexed). Must match the index used to build the
+                        inpainting prior, otherwise nothing will match.
     Returns:
         Filtered list of generated molecules
     """
@@ -254,6 +250,7 @@ def filter_substructure(
             inpainting_mode,
             substructure_query=substructure_query,
             max_fragment_cuts=max_fragment_cuts,
+            ring_system_index=ring_system_index,
             canonicalize_conformer=canonicalize_conformer,
         ):
             filtered_ligs.append(gen_mol)
@@ -266,6 +263,7 @@ def check_substructure_match(
     inpainting_mode: str,
     substructure_query: Optional[str] = None,
     max_fragment_cuts: int = 3,
+    ring_system_index: int = 0,
     canonicalize_conformer: Optional[bool] = False,
 ) -> bool:
     """
@@ -279,6 +277,9 @@ def check_substructure_match(
                         'interaction_conditional']
         substructure_query: SMILES/SMARTS string for substructure mode or list of atom IDs
         max_fragment_cuts: Maximum cuts for fragment mode
+        ring_system_index: Which ring system is kept as the core in 'core_growing'
+                        mode (0-indexed). Must match the index used to build the
+                        inpainting prior, otherwise nothing will match.
 
     Returns:
         True if the generated molecule contains the required substructure, False otherwise
@@ -297,7 +298,9 @@ def check_substructure_match(
     elif inpainting_mode == "linker_inpainting":
         expected_mask = extract_linkers([ref_mol], invert_mask=True)[0]
     elif inpainting_mode == "core_growing":
-        expected_mask = extract_cores([ref_mol])[0]
+        expected_mask = extract_cores(
+            [ref_mol], ring_system_index=ring_system_index
+        )[0]
     elif inpainting_mode == "fragment_inpainting":
         expected_mask = extract_fragments([ref_mol], maxCuts=max_fragment_cuts)[0]
     elif inpainting_mode == "substructure_inpainting":
@@ -752,7 +755,9 @@ def load_data_from_lmdb(
     # Split the dataset for multi-processing via job arrays
     if hasattr(args, "mp_index"):
         systems = [system for system in dataset if system is not None]
-        systems = split_list(systems, args.gpus)[args.mp_index - 1]
+        # ``--gpus`` is a device *count* and ``--gpus 0`` selects CPU, so taking it
+        # literally as a shard count raises ZeroDivisionError. CPU is one shard.
+        systems = split_list(systems, max(1, args.gpus))[args.mp_index - 1]
         return systems
 
     return dataset
@@ -791,6 +796,18 @@ def load_data_from_pdb(
         chain_id=chain_id,
         **processing_params,
     )
+    if system is None:
+        # process_complex() returns None on every failure it handles itself (empty or
+        # too-small pocket, unreadable ligand, ...). Calling remove_hs() on that None
+        # raised a bare AttributeError, which told the user nothing -- most visibly
+        # when --chain_id picked a real chain that holds no pocket for this ligand.
+        source = args.pdb_file if args.pdb_file is not None else args.pdb_id
+        detail = f" for chain '{chain_id}'" if chain_id is not None else ""
+        raise RuntimeError(
+            f"Could not build a pocket complex from {source}{detail}. "
+            "See the messages above for the reason (e.g. an empty or too-small "
+            "pocket, or a ligand that could not be read)."
+        )
     # Forward remove_aromaticity so the ligand is re-featurized in the SAME bond
     # representation the model was trained on. remove_hs() re-runs mol_to_torch on
     # the ligand; without remove_aromaticity it sanitizes to aromatic bonds
@@ -861,7 +878,9 @@ def load_data_from_lmdb_mol(
         f"Dataset split is set to {args.dataset_split}. Number of molecules: {len(dataset)}"
     )
     molecules = [molecule for molecule in dataset if molecule is not None]
-    molecules = split_list(molecules, args.gpus)[args.mp_index - 1]
+    # ``--gpus`` is a device *count* and ``--gpus 0`` selects CPU, so taking it
+    # literally as a shard count raises ZeroDivisionError. CPU is one shard.
+    molecules = split_list(molecules, max(1, args.gpus))[args.mp_index - 1]
     return molecules
 
 
@@ -907,7 +926,9 @@ def load_data_from_sdf_mol(
 
     print(f"Number of molecules: {len(dataset)}")
     molecules = [molecule for molecule in dataset if molecule is not None]
-    molecules = split_list(molecules, args.gpus)[args.mp_index - 1]
+    # ``--gpus`` is a device *count* and ``--gpus 0`` selects CPU, so taking it
+    # literally as a shard count raises ZeroDivisionError. CPU is one shard.
+    molecules = split_list(molecules, max(1, args.gpus))[args.mp_index - 1]
     return molecules
 
 
@@ -968,6 +989,10 @@ def write_ligand_pocket_complex_pdb(
         raise ValueError("No ligand molecules provided.")
     if not all_gen_pdbs:
         raise ValueError("No pocket PDB files provided.")
+
+    # PyMOL is an optional dependency (no linux-aarch64 wheel exists upstream) and
+    # is only needed by this helper, so import it lazily.
+    from pymol import cmd
 
     for i, (lig, pdb_file) in enumerate(zip(all_gen_ligs, all_gen_pdbs)):
         out_path = Path(output_path) / f"{complex_name}_{i}.pdb"
@@ -1475,3 +1500,57 @@ def optimize_molecule_rdkit(mol):
     except Exception as e:
         print(f"Error optimizing molecule: {e}")
         return None, None, None
+
+
+def repair_stats_summary(model):
+    """The valence-repair census for a finished run, or ``None`` if the repair was OFF.
+
+    Read off the builder, which accumulates for the life of the process: nothing calls
+    ``reset_repair_stats`` after construction, which is what a whole-run census wants.
+
+    Keyed on the FLAG, not on ``attempted``. Returning ``None`` for "nothing was
+    over-valent" would make a clean run indistinguishable from a run where the flag was
+    never passed, and those are different facts -- the first says the repair had nothing to
+    do, the second says it was not asked.
+
+    Worth recording rather than leaving on the object: ``cap_states`` and ``cap_edits`` are
+    the honesty mechanism -- a search that ran out of budget leaves the molecule UNREPAIRED,
+    and without the counts a truncated search reads as "everything that could be repaired
+    was".
+    """
+    builder = getattr(model, "builder", None)
+    if builder is None or not getattr(builder, "ligand_valence_repair", False):
+        return None
+    stats = getattr(builder, "repair_stats", None)
+    return dict(stats) if stats else None
+
+
+def print_repair_stats(stats):
+    """Print the census returned by :func:`repair_stats_summary`, if there is one."""
+    if not stats:
+        return
+    attempted = stats["attempted"]
+    repaired = stats["repaired"]
+    if not attempted:
+        print("\nValence repair: ON, but no build failed with an over-valence.")
+        return
+    print(
+        f"\nValence repair: {repaired}/{attempted} failed builds repaired "
+        f"({stats['repaired_ok']} connected, {stats['repaired_disconnected']} disconnected), "
+        f"{stats['unrepaired']} unrepairable, {stats['rejected']} rejected by the rebuild."
+    )
+    if stats["cap_states"] or stats["cap_edits"]:
+        print(
+            f"  bounds hit: max_states x{stats['cap_states']}, max_edits x{stats['cap_edits']} "
+            "-- those molecules were left UNREPAIRED, so this is not a complete search."
+        )
+    if stats["edits_bond_deletions"]:
+        print(
+            f"  {stats['edits_bond_deletions']} accepted edit(s) DELETED a bond; "
+            f"{stats['repaired_disconnected']} repair(s) came back disconnected."
+        )
+    if stats["unrepaired_deletion_blocked"]:
+        print(
+            f"  {stats['unrepaired_deletion_blocked']} molecule(s) were left unrepaired with "
+            "a bond deletion suppressed -- what the no-deletion guard cost."
+        )

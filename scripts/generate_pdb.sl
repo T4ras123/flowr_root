@@ -7,15 +7,19 @@
 #SBATCH --cpus-per-task=12
 #SBATCH --partition=YOUR_PARTITION
 #SBATCH --gres=gpu:1
+# NOTE: SLURM does not create these directories -- `mkdir -p` the slurm_outs path
+# once before your first submission or the job dies with
+# "slurmstepd: error: Unable to open file" and no other output.
 #SBATCH --output=YOUR_CODE_PATH/slurm_outs/pdb_gen/generate-sbdd_%j.out
 #SBATCH --error=YOUR_CODE_PATH/slurm_outs/pdb_gen/generate-sbdd_%j.err
 
+# ENVIRONMENT SETUP
+# One-time setup, from the repo root (pick the extra that matches the machine):
+#   uv sync --extra gpu   # Linux + NVIDIA GPU (CUDA 13 wheels)
+#   uv sync --extra cpu   # macOS / CPU-only
+# `uv run --no-sync` then uses .venv directly without re-resolving.
+export PATH="$HOME/.local/bin:$PATH"
 cd YOUR_CODE_PATH/flowr_root
-source YOUR_ENV_PATH/miniforge3/etc/profile.d/mamba.sh
-source YOUR_ENV_PATH/miniforge3/etc/profile.d/conda.sh
-conda activate flowr_root
-
-export PYTHONPATH="YOUR_CODE_PATH/flowr_root"
 
 # COMPUTE
 num_gpus=1
@@ -23,11 +27,15 @@ num_workers=12
 
 # MAIN PATH
 dataset="YOUR_PROJECT_NAME"
-data_path="MAIN_PATH/$dataset"
+data_path="YOUR_MAIN_PATH/$dataset"
+
+# SAMPLING
+sampling_strategy="linear"
+#sampling_strategy="log"
 
 # CKPT PATH
 ckpt_path="YOUR_CKPT_PATH"
-ckpt="$ckpt_path/flowr_root.ckpt"
+ckpt="$ckpt_path/flowr_root_v2.2.ckpt"
 
 
 # SAMPLING STEPS
@@ -59,7 +67,21 @@ save_dir="$data_path/processed$conditional_generation$sample_mol_sizes$noise_inj
 # BATCH SIZE
 batch_cost=20
 
-python -m flowr.gen.generate_from_pdb \
+# DIVERSITY FILTERING
+# --filter_diversity discards a generated molecule whose Tanimoto similarity to an
+# already-kept one exceeds --diversity_threshold. This script used to ship 0.7, which
+# is stricter than the 0.9 CLI default and far too strict for any of the conditional
+# modes commented out below: inpainted outputs are similar by construction - they all
+# keep the same fixed core - so nearly every pair trips the threshold and the run
+# starves. Measured on 1iep, substructure inpainting produced 20 valid, fully
+# substructure-matching molecules per iteration yet finished with 2 ligands after 11
+# iterations (411 s), against 8-20 molecules in a third of the time with the filter off.
+# 0.95 only drops near-duplicates. When you enable an inpainting mode below, delete the
+# --filter_diversity and --diversity_threshold lines from the command entirely.
+# NOTE: keep comments out of the command itself - a comment inside a `\` continuation
+# truncates it, and the next flag is then run as a command.
+
+uv run --no-sync python -m flowr.gen.generate_from_pdb \
     --pdb_file "$data_path/YOUR_PROTEIN.pdb" \
     --ligand_file "$data_path/YOUR_LIGAND.sdf" \
     --arch pocket \
@@ -78,7 +100,7 @@ python -m flowr.gen.generate_from_pdb \
     --ode_sampling_strategy "$sampling_strategy" \
     --filter_valid_unique \
     --filter_diversity \
-    --diversity_threshold 0.7 \
+    --diversity_threshold 0.95 \
     # --sample_mol_sizes \
     # --scaffold_hopping \
     # --scaffold_elaboration \

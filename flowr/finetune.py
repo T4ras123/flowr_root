@@ -152,7 +152,6 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--load_ckpt", type=str, default=None)
     parser.add_argument("--ckpt_path", type=str, default=None)
-    parser.add_argument("--load_pretrained_ckpt", action="store_true")
     parser.add_argument("--save_dir", type=str, default="./flowr_logs")
     parser.add_argument("--val_check_epochs", type=int, default=None)
     parser.add_argument("--val_check_interval", type=float, default=0.5)
@@ -282,7 +281,16 @@ if __name__ == "__main__":
     parser.add_argument("--lr_gamma", type=float, default=DEFAULT_LR_GAMMA)
     parser.add_argument("--cosine_decay_fraction", type=float, default=1.0)
     parser.add_argument("--warm_up_steps", type=int, default=DEFAULT_WARM_UP_STEPS)
-    parser.add_argument("--use_ema", action="store_true")
+    # BooleanOptionalAction (not store_true) so EMA can actually be switched off:
+    # --use_ema / --no-use_ema. It used to be a store_true that parser.set_defaults()
+    # then forced back to True, which made --use_ema decoration and left no way to
+    # disable EMA at all. Relevant for small fine-tuning sets, where a high ema_decay
+    # means the evaluated EMA weights are still essentially the pretrained ones, so
+    # validation metrics and save_top_k selection say very little -- lower --ema_decay
+    # (or pass --no-use_ema) when the dataset is small.
+    parser.add_argument(
+        "--use_ema", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--ema_decay", type=float, default=0.998)
 
     ################################ INTERPOLATION ################################
@@ -383,7 +391,6 @@ if __name__ == "__main__":
     ################################ DEFAULTS ################################
     parser.set_defaults(
         trial_run=False,
-        use_ema=True,
         # self_condition=True,
     )
 
