@@ -59,3 +59,10 @@ Miniforge3-*.sh
 slurm_outs/
 *.ckpt
 casf16_*_flowr_conformers.pkl
+
+*.pkl
+*.pickle
+casf_benchmark_runs/
+*.csv
+*.txt
+*.sqlite
